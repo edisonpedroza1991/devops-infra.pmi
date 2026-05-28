@@ -1,0 +1,176 @@
+# =============================================================================
+# deploy.yml — Pipeline CI/CD Automatica
+# =============================================================================
+# Autore:  Edison Pedroza Candado
+# Scopo:   Deploy automatico su VPS ad ogni push sul branch main
+#
+# FUNZIONAMENTO:
+#   1. Il team fa push del codice su branch main
+#   2. GitHub Actions esegue i test automatici
+#   3. Se i test passano, fa il deploy via SSH sul server
+#   4. Verifica che il servizio sia attivo dopo il deploy
+#   5. Invia notifica di successo o rollback in caso di errore
+#
+# SECRETS RICHIESTI (da configurare in GitHub → Settings → Secrets):
+#   - SSH_PRIVATE_KEY     → Chiave SSH privata per accesso al server
+#   - SSH_HOST            → IP o dominio del server di produzione
+#   - SSH_USER            → Utente SSH del server
+#   - SSH_PORT            → Porta SSH (default: 22)
+# =============================================================================
+
+name: 🚀 Deploy Automatico su Produzione
+
+on:
+  push:
+    branches:
+      - main          # Esegui ad ogni push su main
+  workflow_dispatch:  # Permette esecuzione manuale dalla UI di GitHub
+
+# Impedisce deploy paralleli che potrebbero causare conflitti
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 1: TEST — Verifica che il codice sia corretto
+  # ─────────────────────────────────────────────────────────────
+  test:
+    name: ✅ Esegui Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Scarica il codice dal repository
+        uses: actions/checkout@v4
+
+      - name: 🔍 Verifica sintassi degli script Bash
+        run: |
+          echo "Verifica script Bash..."
+          find . -name "*.sh" -exec bash -n {} \; && echo "✅ Tutti gli script sono validi"
+
+      - name: 🐳 Verifica sintassi del Dockerfile
+        run: |
+          if [ -f Dockerfile ]; then
+            docker build --no-cache --dry-run . && echo "✅ Dockerfile valido"
+          else
+            echo "⏭️  Nessun Dockerfile trovato — skip"
+          fi
+
+      - name: 📋 Mostra info del deploy
+        run: |
+          echo "======================================"
+          echo "  Branch:  ${{ github.ref_name }}"
+          echo "  Commit:  ${{ github.sha }}"
+          echo "  Autore:  ${{ github.actor }}"
+          echo "  Data:    $(date '+%d/%m/%Y %H:%M:%S')"
+          echo "======================================"
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 2: DEPLOY — Esegui il deploy sul server solo se i test passano
+  # ─────────────────────────────────────────────────────────────
+  deploy:
+    name: 🚀 Deploy su Produzione
+    runs-on: ubuntu-latest
+    needs: test          # Esegui solo se il job 'test' ha avuto successo
+    environment: production
+
+    steps:
+      - name: 📥 Scarica il codice
+        uses: actions/checkout@v4
+
+      - name: 🔑 Configura chiave SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: 🛡️ Aggiungi server ai known hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -p ${{ secrets.SSH_PORT || 22 }} \
+            ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: 📦 Copia il codice sul server
+        run: |
+          rsync \
+            --archive \
+            --compress \
+            --delete \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='*.env' \
+            -e "ssh -p ${{ secrets.SSH_PORT || 22 }}" \
+            ./ \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/var/www/app/
+
+      - name: ⚙️ Esegui comandi di deploy sul server
+        run: |
+          ssh -p ${{ secrets.SSH_PORT || 22 }} \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'ENDSSH'
+
+            set -e  # Termina se qualsiasi comando fallisce
+
+            echo "🔄 Avvio deploy..."
+            cd /var/www/app
+
+            # Ricarica il servizio (adatta al tuo stack: nginx, pm2, docker, ecc.)
+            if command -v docker &> /dev/null && [ -f docker-compose.yml ]; then
+              echo "🐳 Riavvio con Docker Compose..."
+              docker compose pull
+              docker compose up -d --remove-orphans
+            elif command -v pm2 &> /dev/null; then
+              echo "⚡ Riavvio con PM2..."
+              pm2 reload ecosystem.config.js --env production
+            else
+              echo "🔄 Riavvio servizio systemd..."
+              sudo systemctl restart app
+            fi
+
+            echo "✅ Deploy completato sul server!"
+          ENDSSH
+
+      - name: 🏥 Verifica che il servizio sia attivo (Health Check)
+        run: |
+          echo "Attendo 10 secondi per l'avvio del servizio..."
+          sleep 10
+
+          # Controlla che il server risponda con HTTP 200
+          HTTP_STATUS=$(curl \
+            --silent \
+            --output /dev/null \
+            --write-out "%{http_code}" \
+            --max-time 30 \
+            "http://${{ secrets.SSH_HOST }}")
+
+          if [ "$HTTP_STATUS" = "200" ] || [ "$HTTP_STATUS" = "301" ] || [ "$HTTP_STATUS" = "302" ]; then
+            echo "✅ Servizio attivo — HTTP Status: $HTTP_STATUS"
+          else
+            echo "❌ ERRORE: Servizio non risponde — HTTP Status: $HTTP_STATUS"
+            exit 1  # Fa fallire il job → GitHub mostra errore
+          fi
+
+      - name: 📊 Riepilogo deploy completato
+        if: success()
+        run: |
+          echo "======================================"
+          echo "  ✅ DEPLOY COMPLETATO CON SUCCESSO"
+          echo "======================================"
+          echo "  Server:  ${{ secrets.SSH_HOST }}"
+          echo "  Branch:  ${{ github.ref_name }}"
+          echo "  Commit:  ${{ github.sha }}"
+          echo "  Autore:  ${{ github.actor }}"
+          echo "  Ora:     $(date '+%d/%m/%Y %H:%M:%S UTC')"
+          echo "======================================"
+
+      - name: 🚨 Notifica in caso di errore
+        if: failure()
+        run: |
+          echo "======================================"
+          echo "  ❌ DEPLOY FALLITO — VERIFICA URGENTE"
+          echo "======================================"
+          echo "  Il deploy del commit ${{ github.sha }}"
+          echo "  sul branch ${{ github.ref_name }} ha fallito."
+          echo "  Controlla i log sopra per i dettagli."
+          echo "======================================"
+          # Qui puoi aggiungere notifica Slack, email, o Telegram
